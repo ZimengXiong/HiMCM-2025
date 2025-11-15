@@ -1,8 +1,12 @@
-we model the building as a graph $g(v, e)$.
+# building model
+
+we model the building as a graph $G = (V, E)$.
 
 ## nodes (v)
 
-- rooms $r$
+each node $v \in V$ is one of:
+
+- rooms $r \in R$
 - hallway junctions
 - stair landings
 - exits to outside
@@ -10,128 +14,255 @@ we model the building as a graph $g(v, e)$.
 
 ## edges (e)
 
-- everything thats walkable:
-  - doorways
-  - corridor segments
-  - stair flights
-- each edge $e$ carries:
-  - length $l_e$ (meters)
-  - time-varying hazard level $h_e(t) \in \{0,1,2,3\}$, updated every minute by cellular automaton:
-    - fire in a room at $t$ ⇒ adjacent edges become $h=1$ (light smoke) at $t+1$
-    - $h=1$ edge becomes $h=2$ (heavy smoke) at $t+2$
-    - $h=2$ edge becomes $h=3$ (impassable fire) at $t+3$
-    - vertical spread: one floor per minute
-    - horizontal spread: one edge per minute
-    - (we should prob define these as variables, idt the spread is that fast b/c then we would be going through all possible states of h in 4 minutes)
+each edge $e = (u, v) \in E$ is one of:
 
-## responder traversal time
+- doorways
+- corridor segments
+- stair flights
 
-a responder who starts traversing edge $e$ at calendar time $t_{start}$ experiences:
+each edge $e$ has:
 
-$$
-t_e(t_{start}) = \frac{l_e}{v_{base}} \cdot \gamma(h_e(t_{start})) \cdot \delta_{carry}
-$$
+- length $l_e$ (meters)
+- cross-sectional area $A_e$
+- optional physical parameters (door open/closed, width, etc.)
 
-the total time, $t_e(t_{start})$, required for a responder to traverse a specific path segment (edge $e$) starting at time $t_{start}$ is calculated by first determining the nominal travel time (ie the segment's length ($l_e$)) divided by the base speed ($v_{base}$) and then inflating this baseline by two factors that account for operational challenges.
+---
 
-- the first factor is the Hazard Multiplier, $\gamma(h_e(t_{start}))$, which dramatically increases the transit time (up to effectively $\infty$) based on the current hazard level ($h$) of the edge, forcing responders to slow down significantly in dangerous areas.
-- the second factor, the Load Multiplier, $\delta_{carry}$, further penalizes the transit time by approximately $1.67$ if the responder is currently carrying a victim, reflecting the decreased speed efficiency ($\eta_{carry} \approx 0.6$) associated with transporting a load.
+# hazard model: reaction–diffusion on the graph
 
-- $\gamma = [1, 2, 4, \infty]$ for $h = [0,1,2,3]$
-- $\delta_{carry} = 1 / \eta_{carry}$ ($\eta_{carry} \approx 0.6$) if carrying a victim, else 1
+the continuous hazard lives on nodes:
 
-the same corridor can take 15 s at $t=19$ or 50 s at $t=21$ if smoke arrives between the two departure instants.
+- $\phi_v(t) \in \mathbb{R}^+$: hazard intensity at node $v$ at time $t$
 
-## responder state vector
+the dynamics follow a reaction–diffusion ODE:
 
-$s_i(t) = (position, cargo, o_2)$
+- $\dfrac{d\phi_v(t)}{dt} = D \sum_{w \in \mathcal{N}(v)} W_{vw} \left(\phi_w(t) - \phi_v(t)\right) + R_v(\phi_v(t), t)$
 
-- **cargo**: toggles empty -> carrying when a victim is discovered; reverts only when an exit node is reached.
-- **oxygen** decays as:
+where:
 
-  $$o_i(t) = o_{max} - \alpha \cdot t - \beta \cdot \sum_{s=0}^{t} h_{exposure}(s)$$
+- $D$: diffusion coefficient  
+- $\mathcal{N}(v)$: neighbors of $v$  
+- $W_{vw}$: conductance on edge $(v, w)$
 
-  - $\alpha$: base consumption
-  - $\beta$: extra in hazard
-  - $o_{max} \approx 1200L$
-  - buffer = 300L
-  - (we prob should do more research on this as well)
-- any route that forecasts $o_i(t_i) < $ buffer is infeasible and discarded during search.
+for edge $e = (v, w)$:
 
-## room properties
+- $W_{vw} = \kappa \dfrac{A_{vw}}{L_{vw}}$
 
-every room $r$ has:
+with $L_{vw} = l_e$ and $A_{vw} = A_e$, and $\kappa$ a scaling constant.
 
-- $t_r^{check}$: deterministic sweep time (e.g., small bedroom 2 min, icu 5 min, warehouse 10 min)
-- $w_r$: risk weight 1…10 (combining occupancy probability and vulnerability)
-- $y_r$: 1 if a victim is actually inside
-  - $y_r$ is revealed only when the room check finishes; until then, treat as a bernoulli draw if from (stats!) distribution, prob need research to find which one we should use
+reaction term $R_v(\cdot)$:
 
-## objective function
+- rooms with fire: non-linear growth (e.g. $t^2$-type HRR mapped into $\phi_v$)
+- corridors / non-sources: decay unless $\phi_v$ exceeds ignition threshold $\phi_{\text{ign}}$, then switch to a growth mode
 
-$j$ balances three competing terms:
+---
 
-$$
-j = \sum_{r \in r} w_r c_r + \lambda \max_i t_i + \mu \sum_i \sum_{r \in p_i} i(r) t_{unsafe}(r)
-$$
+# from node hazard to edge hazard
 
-- $c_r$: clock time when room $r$ is declared clear (risk-weighted completion)
-- $t_i$: total time responder $i$ spends until her last task (makespan load-balancing)
-- $i(r) = 1$ iff $w*r > w_{critical}$
-- $t_{unsafe}(r)$: interval the responder is alone inside $r$ (safety penalty for solo sweeping of critical rooms)
+for edge $e = (u, v)$:
+
+- continuous edge hazard: $\phi_e(t) = H(\phi_u(t), \phi_v(t))$
+
+simple choices:
+
+- $\phi_e(t) = \max\{\phi_u(t), \phi_v(t)\}$
+- $\phi_e(t) = \dfrac{\phi_u(t) + \phi_v(t)}{2}$
+
+discrete hazard level:
+
+- thresholds $0 = \tau_0 < \tau_1 < \tau_2 < \tau_3 < \tau_4 = \infty$
+- $h_e(t) = \Psi(\phi_e(t))$, with $h_e(t) = k$ if $\tau_k \le \phi_e(t) < \tau_{k+1}$, $k \in \{0,1,2,3\}$
+
+---
+
+# precomputing the hazard field
+
+we pre-solve the ODE before routing:
+
+- choose horizon $[0, T_{\max}]$ and time step $\Delta t_{\text{RD}}$
+- integrate $\dfrac{d\boldsymbol{\phi}(t)}{dt} = D L_W \boldsymbol{\phi}(t) + \mathbf{R}(\boldsymbol{\phi}(t), t)$  
+  where $\boldsymbol{\phi}(t)$ stacks all $\phi_v(t)$ and $L_W$ is the weighted Laplacian
+- store $\phi_v(t_k)$ for all nodes and time points $t_k$
+- at query time:
+  - interpolate $\phi_v(t)$ for arbitrary $t$
+  - compute $\phi_e(t)$ and $h_e(t)$ via $H$ and $\Psi$
+
+---
+
+# responder traversal time
+
+a responder who starts traversing edge $e$ at time $t_{\text{start}}$ has traversal time:
+
+- $t_e(t_{\text{start}}) = \dfrac{l_e}{v_{\text{base}}} \cdot \gamma\big(h_e(t_{\text{start}})\big) \cdot \delta_{\text{carry}}$
+
+where:
+
+- $v_{\text{base}}$: base walking speed  
+- $h_e(t_{\text{start}}) = \Psi\big(H(\phi_u(t_{\text{start}}), \phi_v(t_{\text{start}}))\big)$  
+- hazard multiplier $\gamma(h)$, e.g. $\gamma = [1, 2, 4, \infty]$ for $h = [0,1,2,3]$
+- load multiplier $\delta_{\text{carry}}$:
+  - $\delta_{\text{carry}} = 1/\eta_{\text{carry}}$, $\eta_{\text{carry}} \approx 0.6$, if carrying
+  - $\delta_{\text{carry}} = 1$ otherwise
+
+assumption: $h_e(t)$ is evaluated once at departure and held constant over the traversal.
+
+---
+
+# responder state + oxygen
+
+responder $i$ has state:
+
+- $s_i(t) = (\text{position}_i(t), \text{cargo}_i(t), o_i(t))$
+
+components:
+
+- $\text{position}_i(t)$: node or edge  
+- $\text{cargo}_i(t)$: empty / carrying  
+- $o_i(t)$: remaining oxygen  
+
+oxygen model:
+
+- $o_i(t) = o_{\max} - \alpha t - \beta \displaystyle \int_0^t g\big(\phi(\text{pos}_i(s), s)\big)\, ds$
+
+parameters:
+
+- $o_{\max} \approx 1200\,\text{L}$
+- buffer $o_{\text{buffer}} \approx 300\,\text{L}$
+- $\alpha$: base consumption rate
+- $\beta$: extra consumption factor
+- $g(\cdot)$: maps local hazard (continuous $\phi$ or discrete $h$) to an exposure factor
+
+in discrete simulation, along a route, for each time segment of length $\Delta t$ with hazard level $h$:
+
+- $\Delta o = \alpha \Delta t + \beta \, g(h) \Delta t$
+
+constraint: any route with $o_i(t_i) < o_{\text{buffer}}$ at completion time $t_i$ is infeasible.
+
+---
+
+# room properties
+
+each room $r$ has:
+
+- $t_r^{\text{check}}$: sweep time (e.g. 2 min, 5 min, 10 min)
+- $w_r \in \{1,\dots,10\}$: risk weight
+- $y_r \in \{0,1\}$: victim present indicator
+
+$y_r$ behavior:
+
+- before sweep: modeled as Bernoulli with scenario-specific probability
+- after sweep: actual value revealed
+
+---
+
+# objective function
+
+let $p_i$ be the ordered rooms visited by responder $i$.
+
+objective:
+
+- $j = \displaystyle \sum_{r \in R} w_r c_r + \lambda \max_i t_i + \mu \sum_i \sum_{r \in p_i} I(r) \, t_{\text{unsafe}}(r)$
+
+where:
+
+- $c_r$: time when room $r$ is declared clear
+- $t_i$: completion time of responder $i$
+- $I(r)$: critical-room indicator
+  - $I(r) = 1$ if $w_r > w_{\text{critical}}$, else $I(r) = 0$
+- $t_{\text{unsafe}}(r)$: time a responder is alone in critical room $r$
 - $\lambda \approx 0.3 \langle w_r \rangle$
-- $\mu$: scenario-dependent (e.g., high in hospital fire, low in empty warehouse)
+- $\mu$: scenario-dependent
 
-## victim transport logic
+---
 
-- if $y_r = 1$ is discovered, the responder’s route is immediately extended by the shortest path from `r` to the nearest exit, computed with $\delta*{carry} = 1/\eta_{carry}$
-- only after dropping off the victim then the responder can continue sweeping.
-- extra travel consumes oxygen and may push the route beyond the buffer; if so, reassign the room to another responder or leave for a later wave.
+# victim transport logic
 
-## solution approach: large-neighborhood search (lns)
+when sweep of room $r$ finishes and $y_r = 1$:
 
-we solve the multi-vehicle routing problem with time-dependent edge costs via lns, a heuristic (approximation)that repeatedly destroys and rebuilds chunks of a feasible assignment (as the problem is too hard to solve-NP Hard)
+- extend the responder’s route by the TDSP path from $r$ to the nearest exit
+- compute traversal times with $\delta_{\text{carry}} = 1/\eta_{\text{carry}}$
+- after drop-off, continue with remaining tasks
 
-### step 1: greedy
+if this extra travel causes $o_i(t_i) < o_{\text{buffer}}$:
+
+- reassign remaining rooms from that responder, or
+- defer them to a later wave
+
+---
+
+# solution approach: large-neighborhood search (LNS)
+
+we solve the multi-vehicle routing problem with time-dependent edge costs and oxygen constraints via LNS.
+
+## step 1: greedy initialization
 
 - sort rooms by descending $w_r$
-- for each room, evaluate insertion cost at every legal position of every responder route (time-dependent shortest path + o₂ check)
-- pick the cheapest feasible insertion
-- result: always feasible, but typically 20–40% above (worse) the best known.
+- for each room $r$:
+  - for each responder $i$ and each insertion position in route $p_i$:
+    - use TDSP to recompute affected paths
+    - update arrival times, sweeps, transport legs, and oxygen
+    - discard infeasible insertions (oxygen or other constraints)
+  - choose feasible insertion with minimal $\Delta j$
 
-### step 2: destroy
+## step 2: destroy
 
-- remove $k = \lceil 0.3 |r| \rceil$ rooms using one of:
+- remove $k = \lceil 0.3 |R| \rceil$ rooms using:
   - random
-  - shaw (geographically and risk-similar rooms assigned to the same responder)
-  - worst-cost (rooms with highest $w_r c_r$ contribution)
-- leaves partial routes feasible.
+  - Shaw (nearby / similar rooms)
+  - worst-cost (highest $w_r c_r$)
 
-### step 3: repair
+## step 3: repair
 
-- for each removed room $r$, enumerate every responder $i$ and every possible insertion slot $p$ in $i$’s current route
-- compute new arrival times with time-dependent dijkstra
-- propagate delays to downstream tasks
-- recompute all three objective terms
-- keep the $(i,p)$ pair that yields the smallest $\delta j$
-- insert $r$ at that position only if $o_i(t_i) \geq$ buffer
-- repair is expensive: per removed room, perform $o(m \cdot |r|/m) = o(|r|)$ shortest-path queries.
+for each removed room $r$:
 
-### step 4: acceptance
+- consider all responders $i$ and all insertion positions in $p_i$
+- for each candidate:
+  - rerun TDSP where needed
+  - propagate timings
+  - recompute oxygen and full objective
+- pick the feasible insertion with smallest $\Delta j$
+- insert $r$ there
 
-- if $j_{new} < j_{current}$: accept and update best if improved
-- else: accept with probability $\exp(-\delta j / t)$, where $t$ follows geometric cooling: $t_k = t_0 \alpha^k$, $t_0 \approx 0.1 j_{initial}$, $\alpha \approx 0.95$
-- occasional uphill moves escape local minima.
+## step 4: acceptance
 
-### step 5: termination
+- if $j_{\text{new}} < j_{\text{current}}$: accept
+- else accept with probability $\exp(-\Delta j / T)$
+- temperature schedule: $T_k = T_0 \alpha^k$ with $T_0 \approx 0.1 \, j_{\text{initial}}$ and $\alpha \approx 0.95$
 
-- stop after 200 consecutive iterations without improving $j_{best}$, or 1000 total iterations (create and calculate loss function) or just stop based on time elapsed
+## step 5: termination
 
-## time-dependent shortest path subroutine
+stop when:
 
-standard dijkstra fails because edge cost $c_e$ depends on arrival time. use a label-setting algorithm on states $(node, arrival_time)$:
+- 200 iterations without improving $j_{\text{best}}$, or
+- 1000 total iterations, or
+- time limit reached
 
-- priority queue keyed by `arrival_time`
-- relax outgoing edge $e$ by evaluating $h_e(t_{current})$ and computing $t_{arrival} = t_{current} + t_e(t_{current})$
-- complexity: $o((|v| + |e|) \log |v|)$ with binary heap
-- optimization: pre-compute all-pairs shortest paths
+---
+
+# time-dependent shortest path (TDSP)
+
+edge cost depends on departure time, so we use a label-setting TDSP algorithm under FIFO.
+
+## state
+
+- labels $(v, t_v)$: earliest known arrival at node $v$
+- priority queue keyed by $t_v$
+
+## relaxation
+
+when popping $(i, t_{\text{current}})$, for each outgoing edge $e = (i, j)$:
+
+- interpolate $\phi_i(t_{\text{current}})$ and $\phi_j(t_{\text{current}})$
+- compute $\phi_e(t_{\text{current}}) = H(\phi_i(t_{\text{current}}), \phi_j(t_{\text{current}}))$
+- compute $h_e(t_{\text{current}}) = \Psi(\phi_e(t_{\text{current}}))$
+- compute $t_e(t_{\text{current}}) = \dfrac{l_e}{v_{\text{base}}} \cdot \gamma(h_e(t_{\text{current}})) \cdot \delta_{\text{carry}}$
+- set $t_{\text{arrival}} = t_{\text{current}} + t_e(t_{\text{current}})$
+- if $t_{\text{arrival}} < t_j$, update $t_j$ and predecessor, and push $(j, t_j)$
+
+## complexity
+
+single-source TDSP:
+
+- $O\big((|V| + |E|)\log |V|\big)$
+
+static all-pairs shortest paths are not valid for exact time-dependent costs; they can only be used as heuristics based on baseline (hazard-free) travel times.
